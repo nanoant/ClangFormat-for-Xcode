@@ -24,5 +24,11 @@
 
 #import <Cocoa/Cocoa.h>
 
-@interface AMSXcodeClangFormat : NSObject
+@interface AMSXcodeClangFormat : NSObject <NSXMLParserDelegate>
+
+- (instancetype)initWithDocument:(NSDocument *)document
+                 replacementData:(NSData *)data;
+
+- (void)format;
+
 @end

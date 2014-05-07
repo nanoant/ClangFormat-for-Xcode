@@ -35,35 +35,16 @@
 - (NSString *)identifier;
 @end
 
-@interface DVTFilePath : NSObject
-- (void)_notifyAssociatesOfChange;
-@end
-
-@interface XCSourceModel : NSObject
-- (BOOL)isInStringConstantAtLocation:(NSUInteger)index;
-@end
-
 @interface NSTextStorage (AMSXcodeClangFormat_DVTSourceTextStorage)
 - (void)replaceCharactersInRange:(NSRange)range
                       withString:(NSString *)string
                  withUndoManager:(id)undoManager;
-- (NSRange)lineRangeForCharacterRange:(NSRange)range;
-- (NSRange)characterRangeForLineRange:(NSRange)range;
-- (void)indentCharacterRange:(NSRange)range undoManager:(id)undoManager;
 - (DVTSourceCodeLanguage *)language;
-- (XCSourceModel *)sourceModel;
 @end
 
 @interface NSDocument (AMSXcodeClangFormat_IDESourceCodeDocument)
 - (NSUndoManager *)undoManager;
 - (NSTextStorage *)textStorage;
-- (void)_respondToFileChangeOnDiskWithFilePath:(DVTFilePath *)filePath;
-- (DVTFilePath *)filePath;
-- (void)ide_revertDocumentToSaved:(id)sender;
-@end
-
-@interface NSTextView (AMSXcodeClangFormat_DVTSourceTextView)
-- (BOOL)isInlineCompleting;
 @end
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -90,49 +71,35 @@ static NSArray *DefaultClangFormatArguments = nil;
                                      didSaveSelector:(SEL)didSaveSelector
                                          contextInfo:(void *)contextInfo
 {
-  if (!delegate) {
-    delegate = self;
-    didSaveSelector =
-        @selector(AMSXcodeClangFormat_document:didSave:contextInfo:);
+  if ([self respondsToSelector:@selector(textStorage)]) {
+    NSTextStorage *textStorage = [self textStorage];
+    if ([textStorage respondsToSelector:@selector(language)]) {
+      NSString *language = [[textStorage language] identifier];
+      if ([ClangFormatPath length] &&
+          [SupportedLanguages containsObject:language]) {
+        [self AMSXcodeClangFormat_format];
+      }
+    }
   }
   [self AMSXcodeClangFormat_saveDocumentWithDelegate:delegate
                                      didSaveSelector:didSaveSelector
                                          contextInfo:contextInfo];
 }
 
-- (void)AMSXcodeClangFormat_document:(NSDocument *)document
-                             didSave:(BOOL)didSave
-                         contextInfo:(void *)contextInfo
+- (void)AMSXcodeClangFormat_format
 {
-  if ([self respondsToSelector:@selector(textStorage)]) {
-    NSTextStorage *textStorage = [self textStorage];
-    if ([textStorage respondsToSelector:@selector(language)]) {
-      NSString *language = [[textStorage language] identifier];
-      if (didSave && [ClangFormatPath length] &&
-          [SupportedLanguages containsObject:language]) {
-        [self performSelectorInBackground:@selector(
-                                              AMSXcodeClangFormat_clangFormat:)
-                               withObject:ClangFormatPath];
-      }
-    }
-  }
-}
-
-- (void)AMSXcodeClangFormat_clangFormat:(NSString *)clangFormatPath
-{
-  NSFileManager *fileManager = [NSFileManager defaultManager];
   NSString *path = [[self fileURL] path];
-
-  NSData *beforeData = [NSData dataWithContentsOfFile:path];
-  NSDictionary *before = [fileManager attributesOfItemAtPath:path error:NULL];
-
+  NSPipe *input = [[NSPipe alloc] init];
+  NSPipe *output = [[NSPipe alloc] init];
   NSTask *task = [[NSTask alloc] init];
-  task.launchPath = clangFormatPath;
+  task.launchPath = ClangFormatPath;
   task.arguments = @[
-    @"-i",
-    [NSString stringWithFormat:@"-style=%@", ClangFormatStyle],
-    path
+    @"-output-replacements-xml",
+    [NSString stringWithFormat:@"-assume-filename=%@", path],
+    [NSString stringWithFormat:@"-style=%@", ClangFormatStyle]
   ];
+  task.standardInput = input;
+  task.standardOutput = output;
   // prepend extra arguments if they are available
   if (ClangFormatArguments.count) {
     task.arguments =
@@ -140,26 +107,22 @@ static NSArray *DefaultClangFormatArguments = nil;
   }
 
 #if DEBUG
-  NSLog(@"launch: %@%@", clangFormatPath,
+  NSLog(@"launch: %@%@", ClangFormatPath,
         [task.arguments componentsJoinedByString:@" "]);
 #endif
   [task launch];
-  [task waitUntilExit];
+  [input.fileHandleForWriting
+      writeData:[self.textStorage.string
+                    dataUsingEncoding:NSUTF8StringEncoding]];
+  [input.fileHandleForWriting closeFile];
+  NSData *data = [output.fileHandleForReading readDataToEndOfFile];
+  AMSXcodeClangFormat *clangFormat =
+      [[AMSXcodeClangFormat alloc] initWithDocument:self replacementData:data];
+  [clangFormat format];
+  [clangFormat release];
   [task release];
-
-  NSDictionary *after = [fileManager attributesOfItemAtPath:path error:NULL];
-  NSData *afterData = [NSData dataWithContentsOfFile:path];
-
-  // this is workaround for Xcode not reloading file if modification date
-  // is the same as saved one, which can happen if we reformat in same second.
-  if (![afterData isEqualToData:beforeData] && before &&
-      [after.fileModificationDate isEqualToDate:before.fileModificationDate]) {
-    NSDictionary *attributes = [NSDictionary
-        dictionaryWithObjectsAndKeys:[after.fileModificationDate
-                                         dateByAddingTimeInterval:1],
-                                     NSFileModificationDate, nil];
-    [fileManager setAttributes:attributes ofItemAtPath:path error:NULL];
-  }
+  [input release];
+  [output release];
 }
 
 @end
@@ -187,7 +150,17 @@ static BOOL Swizzle(Class class, SEL original, SEL replacement)
   return YES;
 }
 
+@interface AMSXcodeClangFormat () {
+  NSDocument *_document;
+  NSData *_data;
+  NSRange _replacementRange;
+  NSMutableString *_replacement;
+  NSInteger offsetDiff;
+}
+@end
+
 @implementation AMSXcodeClangFormat
+
 + (void)pluginDidLoad:(NSBundle *)bundle
 {
   NSString *bundleIdentifier = [[NSBundle mainBundle] bundleIdentifier];
@@ -253,6 +226,102 @@ static BOOL Swizzle(Class class, SEL original, SEL replacement)
   LOAD_DEFAULT(NSString, ClangFormatPath);
   LOAD_DEFAULT(NSString, ClangFormatStyle);
   LOAD_DEFAULT(NSArray, ClangFormatArguments);
+}
+
+- (instancetype)initWithDocument:(NSDocument *)document
+                 replacementData:(NSData *)data
+{
+  if ((self = [super init])) {
+    _document = [document retain];
+    _data = [data retain];
+  }
+  return self;
+}
+
+- (void)format
+{
+  NSXMLParser *parser = [[NSXMLParser alloc] initWithData:_data];
+  parser.delegate = self;
+  [parser parse];
+  [parser release];
+}
+
+#pragma mark - XML parser delegate
+
+- (void)parserDidStartDocument:(NSXMLParser *)parser
+{
+#if DEBUG
+  NSLog(PLUGIN @" start format");
+#endif
+  [_document.undoManager beginUndoGrouping];
+  _replacementRange.location = NSNotFound;
+}
+
+- (void)parserDidEndDocument:(NSXMLParser *)parser
+{
+#if DEBUG
+  NSLog(PLUGIN @" end format");
+#endif
+  [_document.undoManager endUndoGrouping];
+}
+
+- (void)parser:(NSXMLParser *)parser
+    didStartElement:(NSString *)elementName
+       namespaceURI:(NSString *)namespaceURI
+      qualifiedName:(NSString *)qName
+         attributes:(NSDictionary *)attributeDict
+{
+  if (![elementName isEqualToString:@"replacement"]) return;
+
+  NSString *offsetText = [attributeDict valueForKey:@"offset"];
+  NSString *lengthText = [attributeDict valueForKey:@"length"];
+  if (offsetText && lengthText) {
+    _replacementRange.location = [offsetText integerValue];
+    _replacementRange.length = [lengthText integerValue];
+  }
+}
+
+- (void)parser:(NSXMLParser *)parser
+    didEndElement:(NSString *)elementName
+     namespaceURI:(NSString *)namespaceURI
+    qualifiedName:(NSString *)qName
+{
+  if (_replacementRange.location != NSNotFound) {
+    NSString *replacement = _replacement ?: @"";
+    _replacementRange.location = (NSInteger)_replacementRange.location + //
+                                 offsetDiff;
+    offsetDiff += (NSInteger)_replacement.length - //
+                  (NSInteger)_replacementRange.length;
+    [_document.textStorage replaceCharactersInRange:_replacementRange
+                                         withString:replacement
+                                    withUndoManager:_document.undoManager];
+#if DEBUG
+    NSLog(PLUGIN @" replace: %lu [%lu] with: '%@'",
+          (unsigned long)_replacementRange.location,
+          (unsigned long)_replacementRange.length, replacement);
+#endif
+  }
+  _replacementRange.location = NSNotFound;
+  [_replacement release], _replacement = nil;
+}
+
+- (void)parser:(NSXMLParser *)parser foundCharacters:(NSString *)string
+{
+  if (_replacementRange.location == NSNotFound || !string.length) return;
+
+  if (!_replacement) {
+    _replacement = [[NSMutableString alloc] initWithString:string];
+  } else {
+    [_replacement appendString:string];
+  }
+}
+
+- (void)dealloc
+{
+  [super dealloc];
+  [_replacement release];
+  [_document release];
+  [_data release];
 }
 
 @end
