@@ -62,6 +62,9 @@ static NSString *DefaultClangFormatStyle = @"file";
 static NSArray *ClangFormatArguments = nil;
 static NSArray *DefaultClangFormatArguments = nil;
 
+static NSRegularExpression *NonASCIIRe = nil;
+static NSRegularExpression *XcodePlaceholderRe = nil;
+
 ////////////////////////////////////////////////////////////////////////////////
 
 #pragma mark - Clang-format on-save
@@ -111,9 +114,44 @@ static NSArray *DefaultClangFormatArguments = nil;
         [task.arguments componentsJoinedByString:@" "]);
 #endif
   [task launch];
+  // replace non-ASCII characters with ';' so we can get proper offsets back
+  NSMutableString *string = self.textStorage.mutableString;
+  NSMutableString *sanitizedString = string;
+  for (NSTextCheckingResult *match in
+       [NonASCIIRe matchesInString:string
+                           options:0
+                             range:NSMakeRange(0, string.length)]) {
+    if (string == sanitizedString) {
+      sanitizedString = [[string mutableCopy] autorelease];
+    }
+    [sanitizedString replaceCharactersInRange:match.range withString:@";"];
+#if DEBUG
+    NSLog(@"sanitize non-ASCII: '%@'", [string substringWithRange:match.range]);
+#endif
+  }
+  // replace all Xcode placeholders '< # ... # >' with '" # ... # "'
+  // (spaces should be ommitted when reading in above quoted samples)
+  for (NSTextCheckingResult *match in
+       [XcodePlaceholderRe matchesInString:string
+                                   options:0
+                                     range:NSMakeRange(0, string.length)]) {
+    if (string == sanitizedString) {
+      sanitizedString = [[string mutableCopy] autorelease];
+    }
+    NSString *sanitizedMatch = [NSString
+        stringWithFormat:
+            @"\"%@\"",
+            [string substringWithRange:NSMakeRange(match.range.location + 1,
+                                                   match.range.length - 2)]];
+    [sanitizedString replaceCharactersInRange:match.range
+                                   withString:sanitizedMatch];
+#if DEBUG
+    NSLog(@"sanitize Xcode placeholder: '%@'",
+          [string substringWithRange:match.range]);
+#endif
+  }
   [input.fileHandleForWriting
-      writeData:[self.textStorage.string
-                    dataUsingEncoding:NSUTF8StringEncoding]];
+      writeData:[sanitizedString dataUsingEncoding:NSUTF8StringEncoding]];
   [input.fileHandleForWriting closeFile];
   NSData *data = [output.fileHandleForReading readDataToEndOfFile];
   AMSXcodeClangFormat *clangFormat =
@@ -187,6 +225,14 @@ static BOOL Swizzle(Class class, SEL original, SEL replacement)
                       @"Xcode.SourceCodeLanguage.Objective-C-Plus-Plus",
                       @"Xcode.SourceCodeLanguage.Objective-J",
                       @"Xcode.SourceCodeLanguage.JavaScript", nil];
+
+  NonASCIIRe = [[NSRegularExpression alloc] initWithPattern:@"[^\x00-\x7E]"
+                                                    options:0
+                                                      error:NULL];
+  XcodePlaceholderRe =
+      [[NSRegularExpression alloc] initWithPattern:@"<\\#[^#]*\\#>"
+                                           options:0
+                                             error:NULL];
 #if DEBUG
   NSLog(PLUGIN @" %@ loaded.",
         [[NSBundle mainBundle]
@@ -234,6 +280,12 @@ static BOOL Swizzle(Class class, SEL original, SEL replacement)
   if ((self = [super init])) {
     _document = [document retain];
     _data = [data retain];
+#if DEBUG
+    NSString *xmlString =
+        [[NSString alloc] initWithData:_data encoding:NSUTF8StringEncoding];
+    NSLog(PLUGIN @" using XML:\n%@", xmlString);
+    [xmlString release];
+#endif
   }
   return self;
 }
