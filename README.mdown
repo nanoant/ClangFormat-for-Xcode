@@ -6,6 +6,14 @@ This plugin is intended to do better job than other plugins, since it does all
 formatting replacements directly in source code buffer, rather than using
 temporary files or whatsoever, so it is quick and it allows undo.
 
+## Features
+
+1. Formatting using replacements rather replacing whole file buffer
+
+2. Preserving cursor placement and highlight
+
+3. Preserving *Xcode* template placeholders
+
 ## Installation
 
 1. Open the project and build the plug-in.
