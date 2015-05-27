@@ -89,6 +89,21 @@ static NSRegularExpression *XcodePlaceholderRe = nil;
                                          contextInfo:contextInfo];
 }
 
+- (void)AMSXcodeClangFormat_saveDocument:(id)sender
+{
+  if ([self respondsToSelector:@selector(textStorage)]) {
+    NSTextStorage *textStorage = [self textStorage];
+    if ([textStorage respondsToSelector:@selector(language)]) {
+      NSString *language = [[textStorage language] identifier];
+      if ([ClangFormatPath length] &&
+          [SupportedLanguages containsObject:language]) {
+        [self AMSXcodeClangFormat_format];
+      }
+    }
+  }
+  [self AMSXcodeClangFormat_saveDocument:sender];
+}
+
 - (void)AMSXcodeClangFormat_format
 {
   NSString *path = [[self fileURL] path];
@@ -211,11 +226,20 @@ static BOOL Swizzle(Class class, SEL original, SEL replacement)
     }
     return;
   }
-  Swizzle(NSClassFromString(@"IDESourceCodeDocument"),
-          @selector(saveDocumentWithDelegate:didSaveSelector:contextInfo:),
-          @selector(AMSXcodeClangFormat_saveDocumentWithDelegate:
-                                                 didSaveSelector:
-                                                     contextInfo:));
+  Class documentClass;
+  if ((documentClass = NSClassFromString(@"IDESourceCodeDocument"))) {
+    Swizzle(documentClass,
+            @selector(saveDocumentWithDelegate:didSaveSelector:contextInfo:),
+            @selector(AMSXcodeClangFormat_saveDocumentWithDelegate:
+                                                   didSaveSelector:
+                                                       contextInfo:));
+  } else if ((documentClass = NSClassFromString(@"IDEEditorDocument"))) {
+    Swizzle(documentClass, @selector(saveDocument:),
+            @selector(AMSXcodeClangFormat_saveDocument:));
+  } else {
+    NSLog(PLUGIN @" error: no known document class found");
+  }
+
   SupportedLanguages = [[NSSet alloc]
       initWithObjects:@"Xcode.SourceCodeLanguage.C", // Xcode 4
                       @"Xcode.SourceCodeLanguage.C++",
